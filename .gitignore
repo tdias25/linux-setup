@@ -1,0 +1,11 @@
+*.retry
+*.log
+*.bak
+*.deb
+*.tar.xz
+*.txz
+__pycache__/
+.env
+.vault*
+*.local.yml
+secrets*

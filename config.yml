@@ -1,0 +1,84 @@
+---
+# Generic defaults. They avoid anything personal or hard to undo.
+# Override them in a file under profiles/.
+
+supported_ubuntu_bases: [noble]
+
+# Safety
+snapshot_before_changes: true
+protected_packages_regex: "^(mint-meta|cinnamon|nemo|muffin|mintinstall|mintupdate|xorg|xserver-xorg-core|network-manager|linux-image|linux-generic|lightdm|slick-greeter|bluez|timeshift|sudo|firefox|nvidia)"
+
+# System
+system_upgrade: true
+install_nvidia_driver: true    # Only runs when an NVIDIA GPU is detected
+
+# Memory
+tune_memory: true
+zram_algorithm: zstd
+zram_percent: 50
+sysctl_settings:
+  vm.swappiness: 100
+  vm.page-cluster: 0
+  vm.vfs_cache_pressure: 50
+  vm.dirty_background_ratio: 5
+  vm.dirty_ratio: 15
+
+# Services
+disable_services: true
+services_to_disable:
+  - NetworkManager-wait-online.service
+  - cups-browsed.service
+  - kerneloops.service
+  - openvpn.service
+  - casper-md5check.service
+
+# Bluetooth. Restarting it briefly disconnects wireless keyboards and mice.
+tune_bluetooth: true
+bluetooth_le_settings:
+  ScanIntervalAutoConnect: 48
+  ScanWindowAutoConnect: 24
+
+# Off by default: these depend on personal preference or specific hardware
+remove_apps: false
+remove_app_packages:
+  - thunderbird
+  - hexchat
+  - transmission-gtk
+  - rhythmbox
+  - hypnotix
+  - drawing
+  - webapp-manager
+  - warpinator
+  - sticky
+  - onboard
+  - orca
+  - brltty
+  - modemmanager
+
+battery_conservation: false    # Lenovo IdeaPad and Legion only
+grub_timeout: null             # A number of seconds, or null to leave it alone
+brave_lightweight_policy: false
+
+install_desktop_tools: false
+desktop_packages: [rofi, gamemode, vulkan-tools, mesa-utils]
+
+rofi_shortcut: ""
+rofi_command: "rofi -show drun -kb-cancel Escape,Control+g,Control+bracketleft,Alt+space"
+
+install_kitty: false
+kitty_version: "0.51.0"
+kitty_sha256: c285daaf1b699997614939c8d1cd92dd8b99302ff12f18efcc3f69382aa72b1d
+kitty_shortcut: ""
+kitty_keymaps:
+  - { key: "ctrl+left", line: "map ctrl+left  neighboring_window left" }
+  - { key: "ctrl+right", line: "map ctrl+right neighboring_window right" }
+  - { key: "ctrl+up", line: "map ctrl+up    neighboring_window up" }
+  - { key: "ctrl+down", line: "map ctrl+down  neighboring_window down" }
+
+install_zsh: false
+zsh_as_default_shell: false
+zsh_theme: clean
+ohmyzsh_commit: c0140703a53eb0d22be44f7bac318d0baacc927c
+
+keyboard_layouts: ""           # Example: "[('xkb', 'br'), ('xkb', 'us+intl')]"
+icon_theme: ""                 # Must already be installed in ~/.icons

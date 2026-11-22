@@ -1,0 +1,18 @@
+---
+# Lenovo Legion 5 15IMH05H with a Brazilian keyboard and a Bluetooth keyboard and mouse.
+remove_apps: true
+battery_conservation: true
+grub_timeout: 1
+brave_lightweight_policy: true
+
+install_desktop_tools: true
+rofi_shortcut: "<Alt>space"
+
+install_kitty: true
+kitty_shortcut: "<Super>t"
+
+install_zsh: true
+zsh_as_default_shell: true
+
+keyboard_layouts: "[('xkb', 'br'), ('xkb', 'us+intl')]"
+icon_theme: Modern-Office-Night-Icons

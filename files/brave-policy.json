@@ -1,0 +1,32 @@
+{
+  "BraveRewardsDisabled": true,
+  "BraveWalletDisabled": true,
+  "BraveVPNDisabled": true,
+  "BraveAIChatEnabled": false,
+  "BraveLocalAIEnabled": false,
+  "BraveNewsDisabled": true,
+  "BraveTalkDisabled": true,
+  "BravePlaylistEnabled": false,
+  "BraveSpeedreaderEnabled": false,
+  "BraveWaybackMachineEnabled": false,
+  "TorDisabled": true,
+
+  "BraveP3AEnabled": false,
+  "BraveStatsPingEnabled": false,
+  "BraveWebDiscoveryEnabled": false,
+  "MetricsReportingEnabled": false,
+  "UrlKeyedAnonymizedDataCollectionEnabled": false,
+  "FeedbackSurveysEnabled": false,
+  "UserFeedbackAllowed": false,
+  "PromotionsEnabled": false,
+  "ShoppingListEnabled": false,
+  "MediaRecommendationsEnabled": false,
+  "PaymentMethodQueryEnabled": false,
+  "AlternateErrorPagesEnabled": false,
+  "SpellCheckServiceEnabled": false,
+  "EnableMediaRouter": false,
+
+  "BackgroundModeEnabled": false,
+  "HardwareAccelerationModeEnabled": true,
+  "HighEfficiencyModeEnabled": true
+}

@@ -1,0 +1,583 @@
+---
+- name: Configure and optimize Linux Mint
+  hosts: localhost
+  connection: local
+  gather_facts: true
+  vars_files:
+    - config.yml
+
+  handlers:
+    - name: Restart zram
+      ansible.builtin.systemd_service:
+        name: zramswap.service
+        state: restarted
+      become: true
+
+    - name: Reload sysctl
+      ansible.builtin.command: sysctl --system
+      become: true
+      changed_when: true
+
+    - name: Update GRUB
+      ansible.builtin.command: update-grub
+      become: true
+      changed_when: true
+
+    - name: Reload udev
+      ansible.builtin.command: udevadm control --reload
+      become: true
+      changed_when: true
+
+    - name: Restart Bluetooth
+      ansible.builtin.systemd_service:
+        name: bluetooth.service
+        state: restarted
+      become: true
+
+  pre_tasks:
+    - name: Detect system, hardware and session
+      ansible.builtin.command: python3 -I {{ playbook_dir }}/scripts/detect.py
+      register: detected
+      changed_when: false
+      check_mode: false
+      tags: [always]
+
+    - name: Store detected values
+      ansible.builtin.set_fact:
+        mint: "{{ detected.stdout | from_json }}"
+      tags: [always]
+
+    - name: Refuse unsupported systems
+      ansible.builtin.assert:
+        that:
+          - mint.distro == 'linuxmint'
+          - mint.ubuntu_codename in supported_ubuntu_bases
+          - ansible_facts.architecture == 'x86_64'
+        fail_msg: "This playbook supports Linux Mint on x86_64 with an Ubuntu base in {{ supported_ubuntu_bases }}."
+      tags: [always]
+
+    - name: Look for a Timeshift snapshot from the last 24 hours
+      ansible.builtin.find:
+        paths: /timeshift/snapshots
+        file_type: directory
+        age: -1d
+      become: true
+      register: recent_snapshots
+      when: snapshot_before_changes | bool and mint.root_fstype == 'ext4'
+      tags: [always]
+
+    - name: Create a restore point
+      ansible.builtin.command:
+        argv:
+          - timeshift
+          - --create
+          - --rsync
+          - --snapshot-device
+          - "{{ mint.root_source }}"
+          - --comments
+          - before mint-setup
+          - --tags
+          - O
+          - --yes
+      become: true
+      changed_when: true
+      when:
+        - snapshot_before_changes | bool
+        - mint.root_fstype == 'ext4'
+        - not ansible_check_mode
+        - recent_snapshots.matched | default(0) == 0
+      tags: [always]
+
+  tasks:
+    # ------------------------------------------------------------ system
+    - name: Upgrade installed packages
+      ansible.builtin.apt:
+        update_cache: true
+        cache_valid_time: 3600
+        upgrade: safe
+      become: true
+      when: system_upgrade | bool
+      tags: [base]
+
+    # ------------------------------------------------------------ NVIDIA
+    - name: NVIDIA driver
+      when: install_nvidia_driver | bool and mint.nvidia_gpu | bool
+      tags: [nvidia]
+      block:
+        - name: Find an installed NVIDIA driver
+          ansible.builtin.shell: >-
+            dpkg-query -W -f='${Package} ${Status}\n' 'nvidia-driver-*' 2>/dev/null |
+            awk '/install ok installed/ {print $1; exit}'
+          register: nvidia_installed
+          changed_when: false
+          check_mode: false
+
+        - name: Find the recommended NVIDIA driver
+          ansible.builtin.shell: >-
+            ubuntu-drivers devices 2>/dev/null |
+            awk '/recommended/ && /nvidia-driver/ {print $3; exit}'
+          register: nvidia_recommended
+          changed_when: false
+          check_mode: false
+          when: nvidia_installed.stdout == ''
+
+        - name: Stop if no driver is recommended
+          ansible.builtin.assert:
+            that: nvidia_recommended.stdout != ''
+            fail_msg: "ubuntu-drivers did not recommend an NVIDIA driver."
+          when: nvidia_installed.stdout == ''
+
+        - name: Choose the driver package
+          ansible.builtin.set_fact:
+            nvidia_package: "{{ nvidia_installed.stdout if nvidia_installed.stdout != '' else nvidia_recommended.stdout }}"
+
+        - name: Install the recommended driver
+          ansible.builtin.command:
+            argv:
+              - ubuntu-drivers
+              - install
+              - "{{ nvidia_package | replace('nvidia-driver-', 'nvidia:') }}"
+          become: true
+          changed_when: true
+          when: nvidia_installed.stdout == '' and not ansible_check_mode
+
+        - name: Find kernels without an NVIDIA module
+          ansible.builtin.shell: |
+            for image in /boot/vmlinuz-*; do
+              kernel="${image#/boot/vmlinuz-}"
+              modinfo -k "$kernel" nvidia >/dev/null 2>&1 || echo "$kernel"
+            done
+          args:
+            executable: /bin/bash
+          register: nvidia_missing
+          changed_when: false
+          check_mode: false
+          when: not ansible_check_mode or nvidia_installed.stdout != ''
+
+        - name: Stop before a Secure Boot system gets an unsigned module
+          ansible.builtin.fail:
+            msg: >-
+              Secure Boot is on and these kernels lack a signed NVIDIA module:
+              {{ nvidia_missing.stdout_lines | join(', ') }}. Do not reboot into them.
+          when:
+            - nvidia_missing.stdout_lines | default([]) | length > 0
+            - mint.secure_boot | bool
+
+        - name: Build the module for the remaining kernels
+          ansible.builtin.apt:
+            name: "{{ nvidia_package | replace('nvidia-driver-', 'nvidia-dkms-') }}"
+            state: present
+          become: true
+          when: nvidia_missing.stdout_lines | default([]) | length > 0
+
+        - name: Verify every kernel has the module
+          ansible.builtin.shell: |
+            for image in /boot/vmlinuz-*; do
+              kernel="${image#/boot/vmlinuz-}"
+              modinfo -k "$kernel" nvidia >/dev/null 2>&1 || { echo "missing: $kernel"; exit 1; }
+            done
+          args:
+            executable: /bin/bash
+          changed_when: false
+          when: not ansible_check_mode
+
+        - name: Enable NVIDIA suspend and resume services
+          ansible.builtin.systemd_service:
+            name: "{{ item }}"
+            enabled: true
+          become: true
+          loop:
+            - nvidia-suspend.service
+            - nvidia-resume.service
+            - nvidia-hibernate.service
+          when: not ansible_check_mode or nvidia_installed.stdout != ''
+
+    # ------------------------------------------------------------ apps
+    - name: Remove unused applications
+      when: remove_apps | bool
+      tags: [debloat]
+      block:
+        - name: List installed packages
+          ansible.builtin.package_facts:
+
+        - name: Choose packages to remove
+          ansible.builtin.set_fact:
+            apps_to_remove: "{{ remove_app_packages | intersect(ansible_facts.packages.keys() | list) }}"
+
+        - name: Simulate the removal
+          ansible.builtin.command:
+            argv: "{{ ['apt-get', '-s', 'purge', '--autoremove'] + apps_to_remove }}"
+          environment:
+            LC_ALL: C
+          register: removal_simulation
+          changed_when: false
+          check_mode: false
+          when: apps_to_remove | length > 0
+
+        - name: Stop if the removal touches a protected package
+          ansible.builtin.assert:
+            that: protected_hits | length == 0
+            fail_msg: "Removal would affect protected packages: {{ protected_hits }}"
+          vars:
+            protected_hits: >-
+              {{ removal_simulation.stdout | regex_findall('(?m)^(?:Remv|Purg) (\S+)')
+                 | select('match', protected_packages_regex) | list }}
+          when: apps_to_remove | length > 0
+
+        - name: Remove the applications
+          ansible.builtin.apt:
+            name: "{{ apps_to_remove }}"
+            state: absent
+            purge: true
+            autoremove: true
+          become: true
+          when: apps_to_remove | length > 0
+
+    - name: Install desktop tools
+      ansible.builtin.apt:
+        name: "{{ desktop_packages }}"
+        state: present
+        update_cache: true
+        cache_valid_time: 3600
+      become: true
+      when: install_desktop_tools | bool
+      tags: [apps]
+
+    # ------------------------------------------------------------ memory
+    - name: Memory tuning
+      when: tune_memory | bool
+      tags: [memory]
+      block:
+        - name: Install zram
+          ansible.builtin.apt:
+            name: zram-tools
+            state: present
+            update_cache: true
+            cache_valid_time: 3600
+          become: true
+
+        - name: Configure compressed swap
+          ansible.builtin.copy:
+            dest: /etc/default/zramswap
+            mode: "0644"
+            content: |
+              ALGO={{ zram_algorithm }}
+              PERCENT={{ zram_percent }}
+              PRIORITY=100
+          become: true
+          notify: Restart zram
+
+        - name: Enable zram
+          ansible.builtin.systemd_service:
+            name: zramswap.service
+            enabled: true
+          become: true
+          when: not ansible_check_mode
+
+        - name: Configure kernel memory settings
+          ansible.builtin.copy:
+            dest: /etc/sysctl.d/90-desempenho.conf
+            mode: "0644"
+            content: |
+              {% for key, value in sysctl_settings.items() %}
+              {{ key }}={{ value }}
+              {% endfor %}
+          become: true
+          notify: Reload sysctl
+
+    # ------------------------------------------------------------ services
+    - name: Disable unneeded services
+      when: disable_services | bool
+      tags: [services]
+      block:
+        - name: List service units
+          ansible.builtin.command: systemctl list-unit-files --type=service --no-legend --plain
+          register: unit_files
+          changed_when: false
+          check_mode: false
+
+        - name: Stop and disable services
+          ansible.builtin.systemd_service:
+            name: "{{ item }}"
+            enabled: false
+            state: stopped
+          become: true
+          loop: "{{ services_to_disable }}"
+          when: (item ~ ' ') in unit_files.stdout
+
+    # ------------------------------------------------------------ Bluetooth
+    - name: Bluetooth reconnection tuning
+      when: tune_bluetooth | bool and mint.bluetooth | bool
+      tags: [bluetooth]
+      block:
+        - name: Scan for known LE devices more often
+          ansible.builtin.lineinfile:
+            path: /etc/bluetooth/main.conf
+            regexp: "^#?{{ item.key }}="
+            line: "{{ item.key }}={{ item.value }}"
+            backrefs: true
+            backup: true
+          become: true
+          loop: "{{ bluetooth_le_settings | dict2items }}"
+          notify: Restart Bluetooth
+
+        - name: Keep the USB Bluetooth adapter from autosuspending
+          ansible.builtin.copy:
+            dest: /etc/modprobe.d/btusb-no-autosuspend.conf
+            mode: "0644"
+            content: |
+              options btusb enable_autosuspend=0
+          become: true
+
+    # ------------------------------------------------------------ laptop
+    - name: Battery conservation mode
+      when: battery_conservation | bool and mint.conservation_path != ''
+      tags: [battery]
+      block:
+        - name: Persist conservation mode
+          ansible.builtin.copy:
+            dest: /etc/udev/rules.d/90-conservacao-bateria.rules
+            mode: "0644"
+            content: |
+              ACTION=="bind", SUBSYSTEM=="platform", DRIVER=="ideapad_acpi", ATTR{conservation_mode}="1"
+          become: true
+          notify: Reload udev
+
+        - name: Read conservation mode
+          ansible.builtin.slurp:
+            src: "{{ mint.conservation_path }}"
+          register: conservation_state
+
+        - name: Enable conservation mode now
+          ansible.builtin.shell: echo 1 > "{{ mint.conservation_path }}"
+          become: true
+          changed_when: true
+          when:
+            - (conservation_state.content | b64decode | trim) != '1'
+            - not ansible_check_mode
+
+    - name: Shorten the GRUB wait
+      ansible.builtin.lineinfile:
+        path: /etc/default/grub
+        regexp: "^GRUB_TIMEOUT="
+        line: "GRUB_TIMEOUT={{ grub_timeout }}"
+        backup: true
+      become: true
+      when: grub_timeout is not none
+      notify: Update GRUB
+      tags: [boot]
+
+    # ------------------------------------------------------------ kitty
+    - name: Kitty terminal
+      when: install_kitty | bool
+      tags: [kitty]
+      vars:
+        kitty_home: "{{ ansible_facts.user_dir }}/.local/kitty.app"
+      block:
+        - name: Check for kitty
+          ansible.builtin.stat:
+            path: "{{ kitty_home }}/bin/kitty"
+          register: kitty_binary
+
+        - name: Create user directories
+          ansible.builtin.file:
+            path: "{{ item }}"
+            state: directory
+          loop:
+            - "{{ kitty_home }}"
+            - "{{ ansible_facts.user_dir }}/.local/bin"
+            - "{{ ansible_facts.user_dir }}/.local/share/applications"
+            - "{{ ansible_facts.user_dir }}/.config/kitty"
+            - "{{ ansible_facts.user_dir }}/.cache/mint-setup"
+
+        - name: Download the pinned kitty release
+          ansible.builtin.get_url:
+            url: "https://github.com/kovidgoyal/kitty/releases/download/v{{ kitty_version }}/kitty-{{ kitty_version }}-x86_64.txz"
+            dest: "{{ ansible_facts.user_dir }}/.cache/mint-setup/kitty-{{ kitty_version }}.txz"
+            checksum: "sha256:{{ kitty_sha256 }}"
+            mode: "0644"
+          when: not kitty_binary.stat.exists and not ansible_check_mode
+
+        - name: Unpack kitty
+          ansible.builtin.unarchive:
+            src: "{{ ansible_facts.user_dir }}/.cache/mint-setup/kitty-{{ kitty_version }}.txz"
+            dest: "{{ kitty_home }}"
+            remote_src: true
+            creates: "{{ kitty_home }}/bin/kitty"
+          when: not kitty_binary.stat.exists and not ansible_check_mode
+
+        - name: Link kitty commands
+          ansible.builtin.file:
+            src: "{{ kitty_home }}/bin/{{ item }}"
+            dest: "{{ ansible_facts.user_dir }}/.local/bin/{{ item }}"
+            state: link
+          loop: [kitty, kitten]
+          when: kitty_binary.stat.exists or not ansible_check_mode
+
+        - name: Add kitty to the applications menu
+          ansible.builtin.shell: >-
+            sed -e "s|^Icon=kitty|Icon={{ kitty_home }}/share/icons/hicolor/256x256/apps/kitty.png|"
+            -e "s|^Exec=kitty|Exec={{ kitty_home }}/bin/kitty|"
+            -e "s|^TryExec=kitty|TryExec={{ kitty_home }}/bin/kitty|"
+            "{{ kitty_home }}/share/applications/{{ item }}"
+            > "{{ ansible_facts.user_dir }}/.local/share/applications/{{ item }}"
+          args:
+            creates: "{{ ansible_facts.user_dir }}/.local/share/applications/{{ item }}"
+          loop: [kitty.desktop, kitty-open.desktop]
+          when: kitty_binary.stat.exists or not ansible_check_mode
+
+        - name: Add window navigation shortcuts
+          ansible.builtin.lineinfile:
+            path: "{{ ansible_facts.user_dir }}/.config/kitty/kitty.conf"
+            regexp: '^map\s+{{ item.key | regex_escape }}\s'
+            line: "{{ item.line }}"
+            create: true
+          loop: "{{ kitty_keymaps }}"
+
+    # ------------------------------------------------------------ zsh
+    - name: Zsh and Oh My Zsh
+      when: install_zsh | bool
+      tags: [zsh]
+      vars:
+        omz_dir: "{{ ansible_facts.user_dir }}/.oh-my-zsh"
+        zshrc: "{{ ansible_facts.user_dir }}/.zshrc"
+      block:
+        - name: Install zsh and git
+          ansible.builtin.apt:
+            name: [zsh, git]
+            state: present
+            update_cache: true
+            cache_valid_time: 3600
+          become: true
+
+        - name: Install Oh My Zsh at a pinned commit
+          ansible.builtin.git:
+            repo: https://github.com/ohmyzsh/ohmyzsh.git
+            dest: "{{ omz_dir }}"
+            version: "{{ ohmyzsh_commit }}"
+            update: false
+
+        - name: Check for a zsh config
+          ansible.builtin.stat:
+            path: "{{ zshrc }}"
+          register: zshrc_file
+
+        - name: Create a zsh config without replacing an existing one
+          ansible.builtin.copy:
+            src: "{{ omz_dir }}/templates/zshrc.zsh-template"
+            dest: "{{ zshrc }}"
+            remote_src: true
+            force: false
+            mode: "0644"
+          when: not zshrc_file.stat.exists and not ansible_check_mode
+
+        - name: Set the zsh theme
+          ansible.builtin.lineinfile:
+            path: "{{ zshrc }}"
+            regexp: "^ZSH_THEME="
+            line: 'ZSH_THEME="{{ zsh_theme }}"'
+          when: zshrc_file.stat.exists or not ansible_check_mode
+
+        - name: Add user commands to PATH
+          ansible.builtin.lineinfile:
+            path: "{{ zshrc }}"
+            line: 'export PATH="$HOME/.local/bin:$PATH"'
+          when: zshrc_file.stat.exists or not ansible_check_mode
+
+        - name: Make zsh the login shell
+          ansible.builtin.user:
+            name: "{{ ansible_facts.user_id }}"
+            shell: /usr/bin/zsh
+          become: true
+          when: zsh_as_default_shell | bool
+
+    # ------------------------------------------------------------ Brave
+    - name: Brave policies
+      when: brave_lightweight_policy | bool and mint.brave | bool
+      tags: [brave]
+      block:
+        - name: Create the Brave policy folder
+          ansible.builtin.file:
+            path: /etc/brave/policies/managed
+            state: directory
+            mode: "0755"
+          become: true
+
+        - name: Install the lightweight policy
+          ansible.builtin.copy:
+            src: files/brave-policy.json
+            dest: /etc/brave/policies/managed/brave-leve.json
+            mode: "0644"
+          become: true
+
+    # ------------------------------------------------------------ Cinnamon
+    - name: Cinnamon desktop
+      when: mint.cinnamon | bool
+      tags: [desktop]
+      vars:
+        helper: "{{ playbook_dir }}/scripts/cinnamon.py"
+        kitty_command: "{{ ansible_facts.user_dir }}/.local/bin/kitty"
+        dry_run: "{{ ['--dry-run'] if ansible_check_mode else [] }}"
+      block:
+        - name: Check for the icon theme
+          ansible.builtin.stat:
+            path: "{{ ansible_facts.user_dir }}/.icons/{{ icon_theme }}"
+          register: icon_theme_dir
+          when: icon_theme != ''
+
+        - name: Apply desktop settings
+          ansible.builtin.command:
+            argv: "{{ ['python3', '-I', helper, 'set', item.schema, item.key, item.value] + dry_run }}"
+          register: desktop_setting
+          changed_when: "'CHANGED' in desktop_setting.stdout"
+          check_mode: false
+          loop_control:
+            label: "{{ item.key }}"
+          loop: >-
+            {{
+              ([{'schema': 'org.cinnamon.desktop.keybindings.wm', 'key': 'activate-window-menu', 'value': '@as []'}]
+                if rofi_shortcut != '' and rofi_shortcut == '<Alt>space' else [])
+              + ([{'schema': 'org.cinnamon.desktop.default-applications.terminal', 'key': 'exec', 'value': "'" ~ kitty_command ~ "'"},
+                  {'schema': 'org.cinnamon.desktop.default-applications.terminal', 'key': 'exec-arg', 'value': "'-e'"}]
+                if install_kitty | bool else [])
+              + ([{'schema': 'org.cinnamon.desktop.input-sources', 'key': 'sources', 'value': keyboard_layouts}]
+                if keyboard_layouts != '' else [])
+              + ([{'schema': 'org.cinnamon.desktop.interface', 'key': 'icon-theme', 'value': "'" ~ icon_theme ~ "'"}]
+                if icon_theme != '' and icon_theme_dir.stat.exists | default(false) else [])
+            }}
+
+        - name: Add the launcher shortcut
+          ansible.builtin.command:
+            argv: "{{ ['python3', '-I', helper, 'shortcut', 'Rofi', rofi_shortcut, rofi_command] + dry_run }}"
+          register: rofi_binding
+          changed_when: "'CHANGED' in rofi_binding.stdout"
+          failed_when: rofi_binding.rc != 0
+          check_mode: false
+          when: rofi_shortcut != ''
+
+        - name: Add the terminal shortcut
+          ansible.builtin.command:
+            argv: "{{ ['python3', '-I', helper, 'shortcut', 'Kitty', kitty_shortcut, kitty_command] + dry_run }}"
+          register: kitty_binding
+          changed_when: "'CHANGED' in kitty_binding.stdout"
+          failed_when: kitty_binding.rc != 0
+          check_mode: false
+          when: install_kitty | bool and kitty_shortcut != ''
+
+        - name: Warn about shortcut conflicts
+          ansible.builtin.debug:
+            msg: "{{ item }}"
+          loop: "{{ [rofi_binding.stdout | default(''), kitty_binding.stdout | default('')] | select('match', 'WARN') | list }}"
+
+        - name: Note a missing icon theme
+          ansible.builtin.debug:
+            msg: "Icon theme {{ icon_theme }} is not in ~/.icons. See 'Manual steps' in the README."
+          when: icon_theme != '' and not (icon_theme_dir.stat.exists | default(false))
+
+  post_tasks:
+    - name: Finish
+      ansible.builtin.debug:
+        msg: >-
+          {{ 'Preview finished. Nothing was changed.' if ansible_check_mode
+             else 'Finished. Reboot, then log in again to apply driver, shell and shortcut changes.' }}
+      tags: [always]

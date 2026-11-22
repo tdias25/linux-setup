@@ -1,0 +1,3 @@
+---
+# Safe baseline: uses the defaults in config.yml.
+snapshot_before_changes: true
